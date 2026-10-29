@@ -1,0 +1,109 @@
+name: FP daily checks (Mac, Windows, iPhone, Android)
+
+on:
+  schedule:
+    - cron: '7 13,16,19,22 * * *' # 9am, noon, 3pm, 6pm US Eastern (EDT)
+  workflow_dispatch:
+
+concurrency:
+  group: smoke
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      BROWSERSTACK_USERNAME: ${{ secrets.BROWSERSTACK_USERNAME }}
+      BROWSERSTACK_ACCESS_KEY: ${{ secrets.BROWSERSTACK_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Private report repo: history scripts live there and results are committed back to it.
+      - uses: actions/checkout@v4
+        with:
+          repository: valentinyeo/funeralprints
+          ssh-key: ${{ secrets.SITE_DEPLOY_KEY }}
+          path: site
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - run: npm install --no-audit --no-fund
+
+      - name: Set build name
+        id: build
+        run: |
+          NAME="FP daily checks $(date -u +'%Y-%m-%d %H:%M') UTC"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "BROWSERSTACK_BUILD_NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: Run Playwright smoke on BrowserStack
+        id: test
+        continue-on-error: true
+        run: npx playwright test --reporter=list,json
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: results.json
+          FP_LOGIN_EMAIL: ${{ secrets.FP_LOGIN_EMAIL }}
+          FP_LOGIN_PASSWORD: ${{ secrets.FP_LOGIN_PASSWORD }}
+
+      - name: Append to smoke history
+        if: always()
+        working-directory: site
+        env:
+          GH_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cp ../results.json . 2>/dev/null || true
+          node .github/scripts/update-history.mjs
+
+      - name: Pull videos and session details from BrowserStack
+        if: always()
+        continue-on-error: true
+        working-directory: site
+        run: node scripts/bs-sessions.mjs 60
+
+      - name: Write step summary
+        if: always()
+        run: |
+          if [ ! -f results.json ]; then
+            echo "No results.json." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          node -e "
+          const s = require('./results.json').stats || {};
+          console.log('## Smoke: ' + (s.expected || 0) + ' passed, ' + (s.unexpected || 0) + ' failed, ' + (s.flaky || 0) + ' flaky');
+          " >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit results to the report repo
+        if: always()
+        working-directory: site
+        env:
+          BUILD_NAME: ${{ steps.build.outputs.name }}
+        run: |
+          git add src/data/smoke-history.json src/data/runs/ src/data/bs-sessions.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No history changes to commit."
+            exit 0
+          fi
+          git config user.name "fp-smoke-bot"
+          git config user.email "fp-smoke-bot@users.noreply.github.com"
+          git commit -m "chore: record smoke run ${BUILD_NAME:-$(date -u +%F)} [skip ci]"
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash origin master || true
+            if git push origin HEAD:master; then
+              echo "Pushed on attempt $i"
+              exit 0
+            fi
+            echo "Push rejected on attempt $i, retrying in 5s..."
+            sleep 5
+          done
+          echo "Push failed after 5 attempts"
+          exit 1
+
+      - name: Fail job on regression
+        if: steps.test.outcome == 'failure'
+        run: exit 1

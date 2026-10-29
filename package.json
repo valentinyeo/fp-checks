@@ -1,0 +1,9 @@
+{
+  "name": "fp-checks",
+  "private": true,
+  "description": "Scheduled BrowserStack checks for funeralprints.com (Mac, Windows, iPhone, Android). Results are written to the private report repo.",
+  "devDependencies": {
+    "@playwright/test": "1.49.1",
+    "typescript": "^5"
+  }
+}
